@@ -2,12 +2,17 @@ import os
 import asyncio
 import math
 import sqlite3
+import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from curl_cffi.requests import AsyncSession
 from dtek_client import DtekClient
-from dtek_client.browser_auth import get_cleared_cookies
+from playwright.async_api import (
+    async_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
+from playwright_stealth import Stealth
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.error import Forbidden, BadRequest
@@ -36,6 +41,7 @@ DTEK_REFRESH_MINUTES = 15
 MONITOR_TICK_SECONDS = 60
 
 DB_PATH = "/data/subscribers.db"
+DTEK_AUTH_PATH = "/data/dtek_auth.json"
 
 BASE_URL = "https://www.dtek-krem.com.ua"
 SCHEDULE_URL = f"{BASE_URL}/ua/shutdowns"
@@ -59,6 +65,110 @@ _auth_cache = {
     "cookies": None,
     "csrf": None,
 }
+
+
+def load_saved_auth():
+    if not os.path.exists(DTEK_AUTH_PATH):
+        return None, None
+
+    try:
+        with open(
+            DTEK_AUTH_PATH,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            data = json.load(file)
+
+        return (
+            data.get("cookies"),
+            None,
+        )
+
+    except Exception as error:
+        print(
+            f"AUTH LOAD ERROR: {error}",
+            flush=True,
+        )
+
+        return None, None
+
+
+def save_auth(cookies):
+    try:
+        with open(
+            DTEK_AUTH_PATH,
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                {
+                    "cookies": cookies,
+                },
+                file,
+                ensure_ascii=False,
+            )
+
+    except Exception as error:
+        print(
+            f"AUTH SAVE ERROR: {error}",
+            flush=True,
+        )
+
+
+async def get_dtek_browser_cookies():
+    async with Stealth().use_async(
+        async_playwright()
+    ) as playwright:
+
+        browser = await playwright.chromium.launch(
+            headless=True
+        )
+
+        context = await browser.new_context(
+            locale="uk-UA",
+        )
+
+        page = await context.new_page()
+
+        try:
+            await page.goto(
+                SCHEDULE_URL,
+                wait_until="domcontentloaded",
+                timeout=45000,
+            )
+
+            try:
+                await page.get_by_text(
+                    "Графік відключень",
+                    exact=False,
+                ).first.wait_for(
+                    state="visible",
+                    timeout=30000,
+                )
+
+            except PlaywrightTimeoutError:
+                raise RuntimeError(
+                    "ДТЕК не пропустив браузер "
+                    "через захист сайту"
+                )
+
+            cookies_raw = await context.cookies()
+
+            cookies = {
+                item["name"]: item["value"]
+                for item in cookies_raw
+            }
+
+            if not cookies:
+                raise RuntimeError(
+                    "ДТЕК не повернув cookies"
+                )
+
+            return cookies
+
+        finally:
+            await browser.close()
+
 
 def format_date_ua(value):
     return f"{value.day}.{value.month}.{value.year}"
@@ -173,7 +283,6 @@ def collect_intervals(
 
     return intervals
 
-
 async def get_auth(force=False):
     if (
         not force
@@ -181,7 +290,7 @@ async def get_auth(force=False):
     ):
         return (
             _auth_cache["cookies"],
-            _auth_cache["csrf"],
+            None,
         )
 
     async with _auth_lock:
@@ -191,20 +300,32 @@ async def get_auth(force=False):
         ):
             return (
                 _auth_cache["cookies"],
-                _auth_cache["csrf"],
+                None,
             )
 
-        cookies, csrf_token = (
-            await get_cleared_cookies(
-                SCHEDULE_URL
-            )
+        if not force:
+            saved_cookies, _ = load_saved_auth()
+
+            if saved_cookies:
+                _auth_cache["cookies"] = (
+                    saved_cookies
+                )
+
+                return (
+                    saved_cookies,
+                    None,
+                )
+
+        cookies = (
+            await get_dtek_browser_cookies()
         )
 
         _auth_cache["cookies"] = cookies
-        _auth_cache["csrf"] = csrf_token
+        _auth_cache["csrf"] = None
 
-        return cookies, csrf_token
+        save_auth(cookies)
 
+        return cookies, None
 
 async def make_session(
     force_auth=False
