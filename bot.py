@@ -1,5 +1,6 @@
 import os
 import asyncio
+import math
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,11 @@ STREET = "вул. Абрикосова"
 GROUP_ID = "GPV4.2"
 GROUP_NAME = "4.2"
 
+HOUSE = "28А"
+
+DTEK_REFRESH_MINUTES = 15
+MONITOR_TICK_SECONDS = 60
+
 BASE_URL = "https://www.dtek-krem.com.ua"
 SCHEDULE_URL = f"{BASE_URL}/ua/shutdowns"
 AJAX_URL = f"{BASE_URL}/ua/ajax"
@@ -48,9 +54,7 @@ _auth_lock = asyncio.Lock()
 _auth_cache = {
     "cookies": None,
     "csrf": None,
-    "created_at": 0.0,
 }
-
 
 def format_date_ua(value):
     return f"{value.day}.{value.month}.{value.year}"
@@ -167,16 +171,9 @@ def collect_intervals(
 
 
 async def get_auth(force=False):
-    now = (
-        asyncio
-        .get_running_loop()
-        .time()
-    )
-
     if (
         not force
         and _auth_cache["cookies"] is not None
-        and now - _auth_cache["created_at"] < 20 * 60
     ):
         return (
             _auth_cache["cookies"],
@@ -184,16 +181,9 @@ async def get_auth(force=False):
         )
 
     async with _auth_lock:
-        now = (
-            asyncio
-            .get_running_loop()
-            .time()
-        )
-
         if (
             not force
             and _auth_cache["cookies"] is not None
-            and now - _auth_cache["created_at"] < 20 * 60
         ):
             return (
                 _auth_cache["cookies"],
@@ -208,7 +198,6 @@ async def get_auth(force=False):
 
         _auth_cache["cookies"] = cookies
         _auth_cache["csrf"] = csrf_token
-        _auth_cache["created_at"] = now
 
         return cookies, csrf_token
 
@@ -575,24 +564,565 @@ def format_current(
 
     return "\n".join(lines)
 
+SUBSCRIBER_CHAT_ID = None
+
+_monitor_cache = {
+    "today_date": None,
+    "today_slots": None,
+    "tomorrow_date": None,
+    "tomorrow_slots": None,
+    "house_entry": None,
+    "last_refresh": None,
+}
+
+_last_emergency_state = None
+_sent_notifications = set()
+
+
+def normalize_house(value):
+    return (
+        str(value)
+        .strip()
+        .upper()
+        .replace("A", "А")
+        .replace("-", "")
+        .replace(" ", "")
+    )
+
+
+def find_house_entry(response):
+    wanted = normalize_house(HOUSE)
+
+    for house_number, entry in response.houses.items():
+        if normalize_house(house_number) == wanted:
+            return entry
+
+    return None
+
+
+def time_to_datetime(
+    target_date,
+    value,
+):
+    if value == "24:00":
+        next_date = (
+            target_date
+            + timedelta(days=1)
+        )
+
+        return datetime(
+            next_date.year,
+            next_date.month,
+            next_date.day,
+            0,
+            0,
+            tzinfo=KYIV_TZ,
+        )
+
+    hours, minutes = map(
+        int,
+        value.split(":"),
+    )
+
+    return datetime(
+        target_date.year,
+        target_date.month,
+        target_date.day,
+        hours,
+        minutes,
+        tzinfo=KYIV_TZ,
+    )
+
+
+def get_outage_intervals(
+    slots,
+    target_date,
+):
+    if not slots:
+        return []
+
+    segments, segment_minutes = (
+        slots_to_segments(slots)
+    )
+
+    raw_intervals = collect_intervals(
+        segments,
+        "off",
+        segment_minutes,
+    )
+
+    result = []
+
+    for start, end in raw_intervals:
+        result.append(
+            (
+                time_to_datetime(
+                    target_date,
+                    start,
+                ),
+                time_to_datetime(
+                    target_date,
+                    end,
+                ),
+                start,
+                end,
+            )
+        )
+
+    return result
+
+
+async def fetch_monitor_snapshot():
+    last_error = None
+
+    for attempt in range(2):
+        session = await make_session(
+            force_auth=(attempt == 1)
+        )
+
+        try:
+            client = DtekClient(
+                "krem",
+                ajax_url=AJAX_URL,
+                session=session,
+                timeout=20,
+            )
+
+            response = (
+                await client.get_home_num(
+                    CITY,
+                    STREET,
+                )
+            )
+
+            now = datetime.now(KYIV_TZ)
+            today = now.date()
+
+            today_slots = None
+            tomorrow_slots = None
+
+            if response.fact is not None:
+                today_ts = (
+                    response.fact.today_ts
+                )
+
+                today_slots = (
+                    response.fact
+                    .get_group_day(
+                        today_ts,
+                        GROUP_ID,
+                    )
+                )
+
+                tomorrow_slots = (
+                    response.fact
+                    .get_group_day(
+                        today_ts + 86400,
+                        GROUP_ID,
+                    )
+                )
+
+            return {
+                "today_date":
+                    today,
+
+                "today_slots":
+                    today_slots,
+
+                "tomorrow_date":
+                    today + timedelta(days=1),
+
+                "tomorrow_slots":
+                    tomorrow_slots,
+
+                "house_entry":
+                    find_house_entry(
+                        response
+                    ),
+            }
+
+        except Exception as error:
+            last_error = error
+
+            print(
+                "MONITOR DTEK ERROR: "
+                f"{type(error).__name__}: "
+                f"{error}",
+                flush=True,
+            )
+
+            _auth_cache["cookies"] = None
+            _auth_cache["csrf"] = None
+
+        finally:
+            await session.close()
+
+    raise last_error
+
+
+async def refresh_monitor_cache():
+    snapshot = (
+        await fetch_monitor_snapshot()
+    )
+
+    _monitor_cache.update(snapshot)
+
+    _monitor_cache[
+        "last_refresh"
+    ] = datetime.now(KYIV_TZ)
+
+
+async def maybe_send_emergency_alert(
+    application,
+):
+    global _last_emergency_state
+
+    if SUBSCRIBER_CHAT_ID is None:
+        return
+
+    house_entry = (
+        _monitor_cache[
+            "house_entry"
+        ]
+    )
+
+    if house_entry is None:
+        return
+
+    current_state = (
+        house_entry
+        .has_current_outage
+    )
+
+    if _last_emergency_state is None:
+        _last_emergency_state = (
+            current_state
+        )
+
+        if not current_state:
+            return
+
+    elif (
+        current_state
+        == _last_emergency_state
+    ):
+        return
+
+    else:
+        _last_emergency_state = (
+            current_state
+        )
+
+    if current_state:
+        lines = [
+            "⚠️ Позапланове відключення",
+            f"📍 {ADDRESS}",
+            "",
+            (
+                "ДТЕК зараз показує "
+                "поточне позапланове "
+                "відключення за цією адресою."
+            ),
+        ]
+
+        if house_entry.start_date:
+            lines.append(
+                f"Початок: "
+                f"{house_entry.start_date}"
+            )
+
+        if house_entry.end_date:
+            lines.append(
+                f"Очікуване завершення: "
+                f"{house_entry.end_date}"
+            )
+
+        await application.bot.send_message(
+            chat_id=SUBSCRIBER_CHAT_ID,
+            text="\n".join(lines),
+        )
+
+    else:
+        await application.bot.send_message(
+            chat_id=SUBSCRIBER_CHAT_ID,
+            text=(
+                "✅ Позапланове "
+                "відключення знято\n"
+                f"📍 {ADDRESS}\n\n"
+                "ДТЕК більше не показує "
+                "поточне позапланове "
+                "відключення за цією адресою."
+            ),
+        )
+
+
+async def maybe_send_schedule_notifications(
+    application,
+):
+    if SUBSCRIBER_CHAT_ID is None:
+        return
+
+    now = datetime.now(KYIV_TZ)
+
+    schedules = [
+        (
+            _monitor_cache[
+                "today_date"
+            ],
+            _monitor_cache[
+                "today_slots"
+            ],
+        ),
+        (
+            _monitor_cache[
+                "tomorrow_date"
+            ],
+            _monitor_cache[
+                "tomorrow_slots"
+            ],
+        ),
+    ]
+
+    for target_date, slots in schedules:
+        if (
+            target_date is None
+            or not slots
+        ):
+            continue
+
+        intervals = (
+            get_outage_intervals(
+                slots,
+                target_date,
+            )
+        )
+
+        for (
+            start_dt,
+            end_dt,
+            start_text,
+            end_text,
+        ) in intervals:
+
+            until_start = (
+                start_dt - now
+            ).total_seconds()
+
+            off_key = (
+                f"{target_date}:"
+                f"off:"
+                f"{start_text}:"
+                f"{end_text}"
+            )
+
+            if (
+                0
+                < until_start
+                <= 30 * 60
+                and off_key
+                not in _sent_notifications
+            ):
+                minutes_left = max(
+                    1,
+                    math.ceil(
+                        until_start / 60
+                    ),
+                )
+
+                await application.bot.send_message(
+                    chat_id=SUBSCRIBER_CHAT_ID,
+                    text=(
+                        "🔌 Увага\n"
+                        f"Через {minutes_left} хв "
+                        "за графіком буде "
+                        "відключення.\n\n"
+                        f"⏰ "
+                        f"{start_text}–{end_text}\n"
+                        f"📍 {ADDRESS}"
+                    ),
+                )
+
+                _sent_notifications.add(
+                    off_key
+                )
+
+            until_end = (
+                end_dt - now
+            ).total_seconds()
+
+            on_key = (
+                f"{target_date}:"
+                f"on:"
+                f"{start_text}:"
+                f"{end_text}"
+            )
+
+            if (
+                start_dt <= now < end_dt
+                and 0
+                < until_end
+                <= 30 * 60
+                and on_key
+                not in _sent_notifications
+            ):
+                minutes_left = max(
+                    1,
+                    math.ceil(
+                        until_end / 60
+                    ),
+                )
+
+                await application.bot.send_message(
+                    chat_id=SUBSCRIBER_CHAT_ID,
+                    text=(
+                        "💡 Увага\n"
+                        f"Приблизно через "
+                        f"{minutes_left} хв "
+                        "за графіком має "
+                        "з'явитися світло.\n\n"
+                        f"⏰ До {end_text}\n"
+                        f"📍 {ADDRESS}"
+                    ),
+                )
+
+                _sent_notifications.add(
+                    on_key
+                )
+
+
+async def monitor_loop(
+    application,
+):
+    await asyncio.sleep(5)
+
+    while True:
+        try:
+            now = datetime.now(KYIV_TZ)
+
+            last_refresh = (
+                _monitor_cache[
+                    "last_refresh"
+                ]
+            )
+
+            need_refresh = (
+                last_refresh is None
+                or
+                now - last_refresh
+                >= timedelta(
+                    minutes=
+                        DTEK_REFRESH_MINUTES
+                )
+            )
+
+            if need_refresh:
+                await refresh_monitor_cache()
+
+                await maybe_send_emergency_alert(
+                    application
+                )
+
+            await maybe_send_schedule_notifications(
+                application
+            )
+
+        except Exception as error:
+            print(
+                "MONITOR ERROR: "
+                f"{type(error).__name__}: "
+                f"{error}",
+                flush=True,
+            )
+
+        await asyncio.sleep(
+            MONITOR_TICK_SECONDS
+        )
+
+
+async def post_init(
+    application,
+):
+    application.bot_data[
+        "monitor_task"
+    ] = asyncio.create_task(
+        monitor_loop(
+            application
+        )
+    )
+
+
+async def post_shutdown(
+    application,
+):
+    task = application.bot_data.get(
+        "monitor_task"
+    )
+
+    if task is None:
+        return
+
+    task.cancel()
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+def register_subscriber(
+    update,
+):
+    global SUBSCRIBER_CHAT_ID
+    global _last_emergency_state
+
+    new_chat_id = (
+        update.effective_chat.id
+    )
+
+    if (
+        SUBSCRIBER_CHAT_ID
+        != new_chat_id
+    ):
+        SUBSCRIBER_CHAT_ID = (
+            new_chat_id
+        )
+
+        _last_emergency_state = None
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    register_subscriber(update)
+
     await update.message.reply_text(
         "💡 Бот контролю відключень\n\n"
         f"📍 {ADDRESS}\n"
         f"🔌 Підчерга {GROUP_NAME}\n\n"
+        "🔔 Автоматичні попередження "
+        "увімкнені для цього чату.\n\n"
         "Обери, що показати:",
         reply_markup=keyboard,
     )
+
+    if (
+        _monitor_cache[
+            "house_entry"
+        ]
+        is not None
+    ):
+        await maybe_send_emergency_alert(
+            context.application
+        )
 
 
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+
+    register_subscriber(update)
+    
     text = update.message.text
 
     now = datetime.now(
@@ -726,6 +1256,8 @@ def main():
         Application
         .builder()
         .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
