@@ -36,7 +36,6 @@ DTEK_REFRESH_MINUTES = 15
 MONITOR_TICK_SECONDS = 60
 
 DB_PATH = "/data/subscribers.db"
-MAX_SUBSCRIBERS = 100
 
 BASE_URL = "https://www.dtek-krem.com.ua"
 SCHEDULE_URL = f"{BASE_URL}/ua/shutdowns"
@@ -346,10 +345,6 @@ async def fetch_dtek_day(
                 "csrf"
             ] = None
 
-            _auth_cache[
-                "created_at"
-            ] = 0.0
-
         finally:
             await session.close()
 
@@ -619,34 +614,11 @@ def init_db():
 
         conn.commit()
 
-
 def add_subscriber(chat_id):
     with sqlite3.connect(DB_PATH) as conn:
-        exists = conn.execute(
-            """
-            SELECT 1
-            FROM subscribers
-            WHERE chat_id = ?
-            """,
-            (chat_id,),
-        ).fetchone()
-
-        if exists:
-            return True
-
-        count = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM subscribers
-            """
-        ).fetchone()[0]
-
-        if count >= MAX_SUBSCRIBERS:
-            return False
-
         conn.execute(
             """
-            INSERT INTO subscribers (
+            INSERT OR IGNORE INTO subscribers (
                 chat_id,
                 created_at
             )
@@ -661,9 +633,6 @@ def add_subscriber(chat_id):
         )
 
         conn.commit()
-
-    return True
-
 
 def remove_subscriber(chat_id):
     with sqlite3.connect(DB_PATH) as conn:
@@ -684,7 +653,6 @@ def remove_subscriber(chat_id):
         )
 
         conn.commit()
-
 
 def get_subscribers():
     with sqlite3.connect(DB_PATH) as conn:
@@ -1351,16 +1319,9 @@ async def start(
         update.effective_chat.id
     )
 
-    subscribed = add_subscriber(
+    add_subscriber(
         chat_id
     )
-
-    if not subscribed:
-        await update.message.reply_text(
-            "⚠️ Досягнуто ліміт "
-            "100 підписників."
-        )
-        return
 
     await update.message.reply_text(
         "💡 Бот контролю відключень\n\n"
