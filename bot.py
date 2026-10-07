@@ -1,6 +1,7 @@
 import os
 import asyncio
 import math
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -9,6 +10,7 @@ from dtek_client import DtekClient
 from dtek_client.browser_auth import get_cleared_cookies
 
 from telegram import Update, ReplyKeyboardMarkup
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -32,6 +34,9 @@ HOUSE = "28А"
 
 DTEK_REFRESH_MINUTES = 15
 MONITOR_TICK_SECONDS = 60
+
+DB_PATH = "/data/subscribers.db"
+MAX_SUBSCRIBERS = 100
 
 BASE_URL = "https://www.dtek-krem.com.ua"
 SCHEDULE_URL = f"{BASE_URL}/ua/shutdowns"
@@ -564,8 +569,6 @@ def format_current(
 
     return "\n".join(lines)
 
-SUBSCRIBER_CHAT_ID = None
-
 _monitor_cache = {
     "today_date": None,
     "today_slots": None,
@@ -575,9 +578,258 @@ _monitor_cache = {
     "last_refresh": None,
 }
 
-_last_emergency_state = None
-_sent_notifications = set()
+def init_db():
+    os.makedirs(
+        os.path.dirname(DB_PATH),
+        exist_ok=True,
+    )
 
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscribers (
+                chat_id INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sent_notifications (
+                chat_id INTEGER NOT NULL,
+                notification_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    chat_id,
+                    notification_key
+                )
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT
+            )
+            """
+        )
+
+        conn.commit()
+
+
+def add_subscriber(chat_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        exists = conn.execute(
+            """
+            SELECT 1
+            FROM subscribers
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        ).fetchone()
+
+        if exists:
+            return True
+
+        count = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM subscribers
+            """
+        ).fetchone()[0]
+
+        if count >= MAX_SUBSCRIBERS:
+            return False
+
+        conn.execute(
+            """
+            INSERT INTO subscribers (
+                chat_id,
+                created_at
+            )
+            VALUES (?, ?)
+            """,
+            (
+                chat_id,
+                datetime.now(
+                    KYIV_TZ
+                ).isoformat(),
+            ),
+        )
+
+        conn.commit()
+
+    return True
+
+
+def remove_subscriber(chat_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            DELETE FROM subscribers
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+
+        conn.execute(
+            """
+            DELETE FROM sent_notifications
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+
+        conn.commit()
+
+
+def get_subscribers():
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT chat_id
+            FROM subscribers
+            """
+        ).fetchall()
+
+    return [
+        row[0]
+        for row in rows
+    ]
+
+
+def notification_was_sent(
+    chat_id,
+    notification_key,
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM sent_notifications
+            WHERE chat_id = ?
+              AND notification_key = ?
+            """,
+            (
+                chat_id,
+                notification_key,
+            ),
+        ).fetchone()
+
+    return row is not None
+
+
+def mark_notification_sent(
+    chat_id,
+    notification_key,
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE
+            INTO sent_notifications (
+                chat_id,
+                notification_key,
+                created_at
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                chat_id,
+                notification_key,
+                datetime.now(
+                    KYIV_TZ
+                ).isoformat(),
+            ),
+        )
+
+        conn.commit()
+
+
+def get_state(state_key):
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT state_value
+            FROM bot_state
+            WHERE state_key = ?
+            """,
+            (state_key,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return row[0]
+
+
+def set_state(
+    state_key,
+    state_value,
+):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE
+            INTO bot_state (
+                state_key,
+                state_value
+            )
+            VALUES (?, ?)
+            """,
+            (
+                state_key,
+                state_value,
+            ),
+        )
+
+        conn.commit()
+
+
+async def send_notification(
+    application,
+    chat_id,
+    text,
+):
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+        )
+
+        return True
+
+    except (Forbidden, BadRequest):
+        remove_subscriber(
+            chat_id
+        )
+
+        return False
+
+    except Exception as error:
+        print(
+            "SEND ERROR: "
+            f"{chat_id}: "
+            f"{type(error).__name__}: "
+            f"{error}",
+            flush=True,
+        )
+
+        return False
+
+async def broadcast(
+    application,
+    text,
+):
+    for chat_id in get_subscribers():
+        await send_notification(
+            application,
+            chat_id,
+            text,
+        )
 
 def normalize_house(value):
     return (
@@ -589,7 +841,6 @@ def normalize_house(value):
         .replace(" ", "")
     )
 
-
 def find_house_entry(response):
     wanted = normalize_house(HOUSE)
 
@@ -598,7 +849,6 @@ def find_house_entry(response):
             return entry
 
     return None
-
 
 def time_to_datetime(
     target_date,
@@ -632,7 +882,6 @@ def time_to_datetime(
         minutes,
         tzinfo=KYIV_TZ,
     )
-
 
 def get_outage_intervals(
     slots,
@@ -670,7 +919,6 @@ def get_outage_intervals(
         )
 
     return result
-
 
 async def fetch_monitor_snapshot():
     last_error = None
@@ -759,7 +1007,6 @@ async def fetch_monitor_snapshot():
 
     raise last_error
 
-
 async def refresh_monitor_cache():
     snapshot = (
         await fetch_monitor_snapshot()
@@ -771,15 +1018,9 @@ async def refresh_monitor_cache():
         "last_refresh"
     ] = datetime.now(KYIV_TZ)
 
-
 async def maybe_send_emergency_alert(
     application,
 ):
-    global _last_emergency_state
-
-    if SUBSCRIBER_CHAT_ID is None:
-        return
-
     house_entry = (
         _monitor_cache[
             "house_entry"
@@ -789,28 +1030,40 @@ async def maybe_send_emergency_alert(
     if house_entry is None:
         return
 
-    current_state = (
+    current_state = bool(
         house_entry
         .has_current_outage
     )
 
-    if _last_emergency_state is None:
-        _last_emergency_state = (
-            current_state
+    current_value = (
+        "1"
+        if current_state
+        else "0"
+    )
+
+    previous_value = get_state(
+        "emergency_state"
+    )
+
+    if previous_value is None:
+        set_state(
+            "emergency_state",
+            current_value,
         )
 
         if not current_state:
             return
 
     elif (
-        current_state
-        == _last_emergency_state
+        previous_value
+        == current_value
     ):
         return
 
     else:
-        _last_emergency_state = (
-            current_state
+        set_state(
+            "emergency_state",
+            current_value,
         )
 
     if current_state:
@@ -837,15 +1090,15 @@ async def maybe_send_emergency_alert(
                 f"{house_entry.end_date}"
             )
 
-        await application.bot.send_message(
-            chat_id=SUBSCRIBER_CHAT_ID,
-            text="\n".join(lines),
+        await broadcast(
+            application,
+            "\n".join(lines),
         )
 
     else:
-        await application.bot.send_message(
-            chat_id=SUBSCRIBER_CHAT_ID,
-            text=(
+        await broadcast(
+            application,
+            (
                 "✅ Позапланове "
                 "відключення знято\n"
                 f"📍 {ADDRESS}\n\n"
@@ -855,14 +1108,19 @@ async def maybe_send_emergency_alert(
             ),
         )
 
-
 async def maybe_send_schedule_notifications(
     application,
 ):
-    if SUBSCRIBER_CHAT_ID is None:
+    subscribers = (
+        get_subscribers()
+    )
+
+    if not subscribers:
         return
 
-    now = datetime.now(KYIV_TZ)
+    now = datetime.now(
+        KYIV_TZ
+    )
 
     schedules = [
         (
@@ -919,8 +1177,6 @@ async def maybe_send_schedule_notifications(
                 0
                 < until_start
                 <= 30 * 60
-                and off_key
-                not in _sent_notifications
             ):
                 minutes_left = max(
                     1,
@@ -929,22 +1185,34 @@ async def maybe_send_schedule_notifications(
                     ),
                 )
 
-                await application.bot.send_message(
-                    chat_id=SUBSCRIBER_CHAT_ID,
-                    text=(
-                        "🔌 Увага\n"
-                        f"Через {minutes_left} хв "
-                        "за графіком буде "
-                        "відключення.\n\n"
-                        f"⏰ "
-                        f"{start_text}–{end_text}\n"
-                        f"📍 {ADDRESS}"
-                    ),
+                text = (
+                    "🔌 Увага\n"
+                    f"Через {minutes_left} хв "
+                    "за графіком буде "
+                    "відключення.\n\n"
+                    f"⏰ "
+                    f"{start_text}–{end_text}\n"
+                    f"📍 {ADDRESS}"
                 )
 
-                _sent_notifications.add(
-                    off_key
-                )
+                for chat_id in subscribers:
+                    if notification_was_sent(
+                        chat_id,
+                        off_key,
+                    ):
+                        continue
+
+                    sent = await send_notification(
+                        application,
+                        chat_id,
+                        text,
+                    )
+
+                    if sent:
+                        mark_notification_sent(
+                            chat_id,
+                            off_key,
+                        )
 
             until_end = (
                 end_dt - now
@@ -962,8 +1230,6 @@ async def maybe_send_schedule_notifications(
                 and 0
                 < until_end
                 <= 30 * 60
-                and on_key
-                not in _sent_notifications
             ):
                 minutes_left = max(
                     1,
@@ -972,23 +1238,34 @@ async def maybe_send_schedule_notifications(
                     ),
                 )
 
-                await application.bot.send_message(
-                    chat_id=SUBSCRIBER_CHAT_ID,
-                    text=(
-                        "💡 Увага\n"
-                        f"Приблизно через "
-                        f"{minutes_left} хв "
-                        "за графіком має "
-                        "з'явитися світло.\n\n"
-                        f"⏰ До {end_text}\n"
-                        f"📍 {ADDRESS}"
-                    ),
+                text = (
+                    "💡 Увага\n"
+                    f"Приблизно через "
+                    f"{minutes_left} хв "
+                    "за графіком має "
+                    "з'явитися світло.\n\n"
+                    f"⏰ До {end_text}\n"
+                    f"📍 {ADDRESS}"
                 )
 
-                _sent_notifications.add(
-                    on_key
-                )
+                for chat_id in subscribers:
+                    if notification_was_sent(
+                        chat_id,
+                        on_key,
+                    ):
+                        continue
 
+                    sent = await send_notification(
+                        application,
+                        chat_id,
+                        text,
+                    )
+
+                    if sent:
+                        mark_notification_sent(
+                            chat_id,
+                            on_key,
+                        )
 
 async def monitor_loop(
     application,
@@ -1038,7 +1315,6 @@ async def monitor_loop(
             MONITOR_TICK_SECONDS
         )
 
-
 async def post_init(
     application,
 ):
@@ -1049,7 +1325,6 @@ async def post_init(
             application
         )
     )
-
 
 async def post_shutdown(
     application,
@@ -1068,61 +1343,76 @@ async def post_shutdown(
     except asyncio.CancelledError:
         pass
 
-
-def register_subscriber(
-    update,
-):
-    global SUBSCRIBER_CHAT_ID
-    global _last_emergency_state
-
-    new_chat_id = (
-        update.effective_chat.id
-    )
-
-    if (
-        SUBSCRIBER_CHAT_ID
-        != new_chat_id
-    ):
-        SUBSCRIBER_CHAT_ID = (
-            new_chat_id
-        )
-
-        _last_emergency_state = None
-
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    register_subscriber(update)
+    chat_id = (
+        update.effective_chat.id
+    )
+
+    subscribed = add_subscriber(
+        chat_id
+    )
+
+    if not subscribed:
+        await update.message.reply_text(
+            "⚠️ Досягнуто ліміт "
+            "100 підписників."
+        )
+        return
 
     await update.message.reply_text(
         "💡 Бот контролю відключень\n\n"
         f"📍 {ADDRESS}\n"
         f"🔌 Підчерга {GROUP_NAME}\n\n"
         "🔔 Автоматичні попередження "
-        "увімкнені для цього чату.\n\n"
+        "увімкнені.\n"
+        "Відписатися: /stop\n\n"
         "Обери, що показати:",
         reply_markup=keyboard,
     )
 
-    if (
+    house_entry = (
         _monitor_cache[
             "house_entry"
         ]
-        is not None
+    )
+
+    if (
+        house_entry is not None
+        and bool(
+            house_entry
+            .has_current_outage
+        )
     ):
-        await maybe_send_emergency_alert(
-            context.application
+        await update.message.reply_text(
+            "⚠️ ДТЕК зараз показує "
+            "позапланове відключення "
+            "за цією адресою."
         )
 
+async def stop(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    remove_subscriber(
+        update.effective_chat.id
+    )
+
+    await update.message.reply_text(
+        "🔕 Автоматичні попередження "
+        "вимкнені.\n\n"
+        "Кнопки «Зараз / Сьогодні / "
+        "Завтра» працюють як і раніше.\n"
+        "Щоб знову підписатися: /start"
+    )
 
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
-    register_subscriber(update)
-    
+   
     text = update.message.text
 
     now = datetime.now(
@@ -1245,12 +1535,13 @@ async def handle_message(
                 "графік ДТЕК."
             )
 
-
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
             "Не задано BOT_TOKEN"
         )
+
+    init_db()    
 
     application = (
         Application
@@ -1269,6 +1560,13 @@ def main():
     )
 
     application.add_handler(
+        CommandHandler(
+            "stop",
+            stop,
+        )
+    )    
+
+    application.add_handler(
         MessageHandler(
             filters.TEXT
             & ~filters.COMMAND,
@@ -1284,7 +1582,6 @@ def main():
     application.run_polling(
         drop_pending_updates=True,
     )
-
 
 if __name__ == "__main__":
     main()
