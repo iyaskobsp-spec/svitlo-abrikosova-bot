@@ -8,11 +8,7 @@ from zoneinfo import ZoneInfo
 
 from curl_cffi.requests import AsyncSession
 from dtek_client import DtekClient
-from playwright.async_api import (
-    async_playwright,
-    TimeoutError as PlaywrightTimeoutError,
-)
-from playwright_stealth import Stealth
+from dtek_client.browser_auth import get_cleared_cookies
 
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.error import Forbidden, BadRequest
@@ -60,6 +56,7 @@ keyboard = ReplyKeyboardMarkup(
 
 
 _auth_lock = asyncio.Lock()
+_dtek_request_lock = asyncio.Lock()
 
 _auth_cache = {
     "cookies": None,
@@ -113,118 +110,6 @@ def save_auth(cookies):
             f"AUTH SAVE ERROR: {error}",
             flush=True,
         )
-
-async def get_dtek_browser_cookies():
-    async with Stealth().use_async(
-        async_playwright()
-    ) as playwright:
-
-        browser = await playwright.chromium.launch(
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ],
-        )
-
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/124.0.0.0 "
-                "Safari/537.36"
-            ),
-            locale="uk-UA",
-            timezone_id="Europe/Kyiv",
-            viewport={
-                "width": 1366,
-                "height": 768,
-            },
-        )
-
-        await context.add_init_script(
-            """
-            Object.defineProperty(
-                navigator,
-                'webdriver',
-                {
-                    get: () => undefined
-                }
-            );
-            """
-        )
-
-        page = await context.new_page()
-
-        try:
-            page_loaded = False
-
-            for attempt in range(2):
-
-                if attempt == 0:
-                    await page.goto(
-                        SCHEDULE_URL,
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-                else:
-                    await page.reload(
-                        wait_until="domcontentloaded",
-                        timeout=60000,
-                    )
-
-                await page.wait_for_timeout(
-                    10000
-                )
-
-                try:
-                    await page.get_by_text(
-                        "Графік відключень",
-                        exact=False,
-                    ).first.wait_for(
-                        state="visible",
-                        timeout=20000,
-                    )
-
-                    page_loaded = True
-                    break
-
-                except PlaywrightTimeoutError:
-                    continue
-
-            if not page_loaded:
-                title = (
-                    await page.title()
-                ).strip()
-
-                raise RuntimeError(
-                    "ДТЕК не пропустив браузер "
-                    "через захист сайту. "
-                    f"Сторінка: "
-                    f"{title or 'без заголовка'}"
-                )
-
-            cookies_raw = (
-                await context.cookies()
-            )
-
-            cookies = {
-                item["name"]: item["value"]
-                for item in cookies_raw
-            }
-
-            if not cookies:
-                raise RuntimeError(
-                    "ДТЕК не повернув cookies"
-                )
-
-            return cookies
-
-        finally:
-            await browser.close()
 
 def format_date_ua(value):
     return f"{value.day}.{value.month}.{value.year}"
@@ -342,7 +227,7 @@ async def get_auth(force=False):
     ):
         return (
             _auth_cache["cookies"],
-            None,
+            _auth_cache["csrf"],
         )
 
     async with _auth_lock:
@@ -352,32 +237,35 @@ async def get_auth(force=False):
         ):
             return (
                 _auth_cache["cookies"],
-                None,
+                _auth_cache["csrf"],
             )
 
         if not force:
             saved_cookies, _ = load_saved_auth()
 
             if saved_cookies:
-                _auth_cache["cookies"] = (
-                    saved_cookies
-                )
+                _auth_cache["cookies"] = saved_cookies
+                _auth_cache["csrf"] = None
 
-                return (
-                    saved_cookies,
-                    None,
-                )
+                return saved_cookies, None
 
-        cookies = (
-            await get_dtek_browser_cookies()
+        cookies, csrf_token = (
+            await get_cleared_cookies(
+                SCHEDULE_URL
+            )
         )
 
+        if not cookies:
+            raise RuntimeError(
+                "ДТЕК не повернув cookies"
+            )
+
         _auth_cache["cookies"] = cookies
-        _auth_cache["csrf"] = None
+        _auth_cache["csrf"] = csrf_token
 
         save_auth(cookies)
 
-        return cookies, None
+        return cookies, csrf_token
 
 async def make_session(
     force_auth=False
@@ -394,7 +282,7 @@ async def make_session(
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
+            "Chrome/120.0.0.0 Safari/537.36"
         ),
         "Accept": (
             "application/json, "
@@ -424,11 +312,20 @@ async def make_session(
         timeout=20.0,
         headers=headers,
         cookies=cookies,
-        impersonate="chrome124",
+        impersonate="chrome120",
     )
 
 
 async def fetch_dtek_day(
+    target_date
+):
+    async with _dtek_request_lock:
+        return await _fetch_dtek_day_locked(
+            target_date
+        )
+
+
+async def _fetch_dtek_day_locked(
     target_date
 ):
     last_error = None
@@ -1062,6 +959,11 @@ def get_outage_intervals(
     return result
 
 async def fetch_monitor_snapshot():
+    async with _dtek_request_lock:
+        return await _fetch_monitor_snapshot_locked()
+
+
+async def _fetch_monitor_snapshot_locked():
     last_error = None
 
     for attempt in range(2):
@@ -1411,7 +1313,7 @@ async def maybe_send_schedule_notifications(
 async def monitor_loop(
     application,
 ):
-    await asyncio.sleep(5)
+    await asyncio.sleep(60)
 
     while True:
         try:
