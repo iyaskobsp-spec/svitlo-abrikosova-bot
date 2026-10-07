@@ -114,45 +114,102 @@ def save_auth(cookies):
             flush=True,
         )
 
-
 async def get_dtek_browser_cookies():
     async with Stealth().use_async(
         async_playwright()
     ) as playwright:
 
         browser = await playwright.chromium.launch(
-            headless=True
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+            ],
         )
 
         context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/124.0.0.0 "
+                "Safari/537.36"
+            ),
             locale="uk-UA",
+            timezone_id="Europe/Kyiv",
+            viewport={
+                "width": 1366,
+                "height": 768,
+            },
+        )
+
+        await context.add_init_script(
+            """
+            Object.defineProperty(
+                navigator,
+                'webdriver',
+                {
+                    get: () => undefined
+                }
+            );
+            """
         )
 
         page = await context.new_page()
 
         try:
-            await page.goto(
-                SCHEDULE_URL,
-                wait_until="domcontentloaded",
-                timeout=45000,
-            )
+            page_loaded = False
 
-            try:
-                await page.get_by_text(
-                    "Графік відключень",
-                    exact=False,
-                ).first.wait_for(
-                    state="visible",
-                    timeout=30000,
+            for attempt in range(2):
+
+                if attempt == 0:
+                    await page.goto(
+                        SCHEDULE_URL,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                else:
+                    await page.reload(
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+
+                await page.wait_for_timeout(
+                    10000
                 )
 
-            except PlaywrightTimeoutError:
+                try:
+                    await page.get_by_text(
+                        "Графік відключень",
+                        exact=False,
+                    ).first.wait_for(
+                        state="visible",
+                        timeout=20000,
+                    )
+
+                    page_loaded = True
+                    break
+
+                except PlaywrightTimeoutError:
+                    continue
+
+            if not page_loaded:
+                title = (
+                    await page.title()
+                ).strip()
+
                 raise RuntimeError(
                     "ДТЕК не пропустив браузер "
-                    "через захист сайту"
+                    "через захист сайту. "
+                    f"Сторінка: "
+                    f"{title or 'без заголовка'}"
                 )
 
-            cookies_raw = await context.cookies()
+            cookies_raw = (
+                await context.cookies()
+            )
 
             cookies = {
                 item["name"]: item["value"]
@@ -169,15 +226,12 @@ async def get_dtek_browser_cookies():
         finally:
             await browser.close()
 
-
 def format_date_ua(value):
     return f"{value.day}.{value.month}.{value.year}"
-
 
 def status_value(status):
     value = getattr(status, "value", str(status))
     return str(value).lower()
-
 
 def slots_to_segments(slots):
     numeric_keys = sorted(
@@ -234,7 +288,6 @@ def slots_to_segments(slots):
 
     return segments, half_minutes
 
-
 def minutes_to_time(total_minutes):
     if total_minutes >= 24 * 60:
         return "24:00"
@@ -243,7 +296,6 @@ def minutes_to_time(total_minutes):
     minutes = total_minutes % 60
 
     return f"{hours:02d}:{minutes:02d}"
-
 
 def collect_intervals(
     segments,
@@ -342,7 +394,7 @@ async def make_session(
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept": (
             "application/json, "
@@ -372,7 +424,7 @@ async def make_session(
         timeout=20.0,
         headers=headers,
         cookies=cookies,
-        impersonate="chrome120",
+        impersonate="chrome124",
     )
 
 
@@ -1382,6 +1434,10 @@ async def monitor_loop(
             )
 
             if need_refresh:
+                _monitor_cache[
+                    "last_refresh"
+                ] = now
+
                 await refresh_monitor_cache()
 
                 await maybe_send_emergency_alert(
